@@ -33,6 +33,10 @@ fn main() {
     }
     if env::var("CARGO_FEATURE_GPL_XATTR").is_ok() {
         sources.push("ext4_xattr.c");
+        // POSIX ACL on-disk/userspace-xattr format conversion. BSD-3-Clause
+        // itself, but only useful alongside the xattr code so it shares the
+        // same feature gate.
+        sources.push("ext4_acl.c");
     }
 
     let mut build = cc::Build::new();
