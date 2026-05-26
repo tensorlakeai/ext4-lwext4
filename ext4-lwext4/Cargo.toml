@@ -26,7 +26,15 @@ tempfile = "3.0"
 default = ["std"]
 std = []
 
-# GPL-licensed features (passed through to ext4-lwext4-sys)
+# GPL-licensed features (passed through to ext4-lwext4-sys).
+#
+# `gpl-xattr` and `gpl-extents` activate the corresponding sys-crate feature
+# AND gate this crate's own `#[cfg(feature = "gpl-xattr")]` code paths (the
+# high-level Ext4Fs xattr methods, namely set_xattr / get_xattr / list_xattr /
+# remove_xattr). `gpl` is the umbrella meta-feature that turns both on — it
+# must chain through the granular binding features, not directly through to
+# the sys crate, otherwise consumers writing `features = ["gpl"]` get the
+# GPL'd C compiled in but no high-level Rust API to call it.
 gpl-xattr = ["ext4-lwext4-sys/gpl-xattr"]
 gpl-extents = ["ext4-lwext4-sys/gpl-extents"]
-gpl = ["ext4-lwext4-sys/gpl"]
+gpl = ["gpl-xattr", "gpl-extents"]
