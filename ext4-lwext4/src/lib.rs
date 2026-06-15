@@ -81,4 +81,4 @@ pub use error::{Error, Result};
 pub use file::File;
 pub use fs::Ext4Fs;
 pub use mkfs::{mkfs, MkfsOptions};
-pub use types::{FileType, FsStats, FsType, Metadata, OpenFlags, SeekFrom};
+pub use types::{FileExtent, FileType, FsStats, FsType, Metadata, OpenFlags, SeekFrom};

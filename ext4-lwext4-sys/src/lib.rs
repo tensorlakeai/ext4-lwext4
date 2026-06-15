@@ -223,6 +223,20 @@ pub struct ext4_mount_stats {
 }
 
 // ============================================================================
+// File extents (from ext4.h)
+// ============================================================================
+
+/// One run of contiguous file data blocks mapped to a contiguous run of image
+/// (block-device) blocks. Returned by [`ext4_file_get_extents`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ext4_file_extent {
+    pub logical_block: u64,
+    pub physical_block: u64,
+    pub block_count: u64,
+}
+
+// ============================================================================
 // mkfs info (from ext4_mkfs.h)
 // ============================================================================
 
@@ -504,6 +518,20 @@ unsafe extern "C" {
 
     /// Check if inode exists
     pub fn ext4_inode_exist(path: *const c_char, inode_type: c_int) -> c_int;
+
+    /// Enumerate a regular file's on-disk data extents (read-only).
+    ///
+    /// Fills `out` with up to `out_cap` extents and writes the true extent
+    /// count to `out_count` (which may exceed `out_cap`, signalling the caller
+    /// to retry with a larger buffer). `block_size` (if non-null) receives the
+    /// filesystem block size in bytes.
+    pub fn ext4_file_get_extents(
+        path: *const c_char,
+        out: *mut ext4_file_extent,
+        out_cap: u32,
+        out_count: *mut u32,
+        block_size: *mut u32,
+    ) -> c_int;
 
     /// Create a special file (device node, fifo, socket)
     pub fn ext4_mknod(path: *const c_char, filetype: c_int, dev: u32) -> c_int;

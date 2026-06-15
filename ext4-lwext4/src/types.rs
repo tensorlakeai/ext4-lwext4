@@ -254,3 +254,19 @@ impl FsStats {
         (self.total_blocks - self.free_blocks) * self.block_size as u64
     }
 }
+
+/// One run of a regular file's stored data, in image (block-device) bytes.
+///
+/// Returned by [`crate::Ext4Fs::file_extents`]. `logical_byte` is the offset
+/// within the file's stored content (extent order, holes excluded);
+/// `image_byte` is where that run lives in the underlying image; `len_bytes`
+/// is the run length. All three are multiples of the filesystem block size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileExtent {
+    /// Offset within the file's stored content (extent order).
+    pub logical_byte: u64,
+    /// Byte offset in the underlying image.
+    pub image_byte: u64,
+    /// Run length in bytes.
+    pub len_bytes: u64,
+}

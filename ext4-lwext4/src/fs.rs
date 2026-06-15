@@ -4,14 +4,14 @@ use crate::blockdev::{BlockDevice, BlockDeviceWrapper};
 use crate::dir::Dir;
 use crate::error::{check_errno, check_errno_with_path, Error, Result};
 use crate::file::File;
-use crate::types::{FileType, FsStats, Metadata, OpenFlags};
+use crate::types::{FileExtent, FileType, FsStats, Metadata, OpenFlags};
 use ext4_lwext4_sys::{
     ext4_atime_get, ext4_atime_set, ext4_cache_flush, ext4_ctime_get, ext4_ctime_set,
-    ext4_device_register, ext4_device_unregister, ext4_dir_mk, ext4_dir_rm, ext4_flink,
-    ext4_fremove, ext4_frename, ext4_fsymlink, ext4_inode_exist, ext4_journal_start,
-    ext4_journal_stop, ext4_mode_get, ext4_mode_set, ext4_mount, ext4_mount_point_stats,
-    ext4_mount_stats, ext4_mtime_get, ext4_mtime_set, ext4_owner_get, ext4_owner_set, ext4_readlink,
-    ext4_recover, ext4_umount,
+    ext4_device_register, ext4_device_unregister, ext4_dir_mk, ext4_dir_rm, ext4_file_extent,
+    ext4_file_get_extents, ext4_flink, ext4_fremove, ext4_frename, ext4_fsymlink, ext4_inode_exist,
+    ext4_journal_start, ext4_journal_stop, ext4_mode_get, ext4_mode_set, ext4_mount,
+    ext4_mount_point_stats, ext4_mount_stats, ext4_mtime_get, ext4_mtime_set, ext4_owner_get,
+    ext4_owner_set, ext4_readlink, ext4_recover, ext4_umount,
 };
 #[cfg(feature = "gpl-xattr")]
 use ext4_lwext4_sys::{ext4_getxattr, ext4_listxattr, ext4_removexattr, ext4_setxattr};
@@ -187,6 +187,57 @@ impl Ext4Fs {
             inodes_per_group: stats.inodes_per_group,
             volume_name,
         })
+    }
+
+    /// Enumerate a regular file's on-disk data extents (read-only).
+    ///
+    /// Returns the byte ranges, in image (block-device) space, that hold the
+    /// file's stored data — for host-side content-addressed chunking that needs
+    /// to locate a file's bytes in the raw image without a kernel mount. Holes
+    /// and unwritten (preallocated, never-written) ranges produce no entry, so
+    /// the extents cover exactly the file's stored bytes (block granularity).
+    /// Physically-contiguous file blocks are coalesced into one extent.
+    ///
+    /// `logical_byte` is the offset within the file's stored content (extent
+    /// order), `image_byte` the offset in the underlying image, `len_bytes` the
+    /// run length. All are multiples of the filesystem block size.
+    pub fn file_extents(&self, path: &str) -> Result<Vec<FileExtent>> {
+        let c_path = self.make_path(path)?;
+
+        // First call probes the true extent count (out=null), then we size the
+        // buffer exactly and fetch. A retry loop tolerates concurrent growth.
+        let mut cap: u32 = 0;
+        loop {
+            let mut count: u32 = 0;
+            let mut block_size: u32 = 0;
+            let mut buf: Vec<ext4_file_extent> = Vec::with_capacity(cap as usize);
+            let out_ptr = if cap == 0 {
+                std::ptr::null_mut()
+            } else {
+                buf.as_mut_ptr()
+            };
+            let ret = unsafe {
+                ext4_file_get_extents(c_path.as_ptr(), out_ptr, cap, &mut count, &mut block_size)
+            };
+            check_errno_with_path(ret, path)?;
+
+            if count > cap {
+                // Buffer too small (or the initial probe): grow and retry.
+                cap = count;
+                continue;
+            }
+
+            unsafe { buf.set_len(count as usize) };
+            let bs = block_size as u64;
+            return Ok(buf
+                .into_iter()
+                .map(|e| FileExtent {
+                    logical_byte: e.logical_block * bs,
+                    image_byte: e.physical_block * bs,
+                    len_bytes: e.block_count * bs,
+                })
+                .collect());
+        }
     }
 
     /// Open a file.
@@ -566,21 +617,37 @@ mod tests {
     use crate::blockdev::FileBlockDevice;
     use crate::mkfs::{mkfs, MkfsOptions};
     use crate::types::OpenFlags;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
     use tempfile::TempDir;
 
-    /// Format a fresh ext4 file in `dir` and return the mounted filesystem.
-    fn formatted_fs(dir: &TempDir, bytes: u64) -> Ext4Fs {
+    /// lwext4 keeps global static state and is not safe under concurrent
+    /// mounts, while `cargo test` runs these tests on parallel threads. Every
+    /// test that mounts a filesystem holds this guard for its whole body, so
+    /// mounts are serialized. Poison is recovered (a panicking test must not
+    /// cascade-fail the others).
+    static EXT4_MOUNT_GUARD: Mutex<()> = Mutex::new(());
+
+    fn mount_guard() -> MutexGuard<'static, ()> {
+        EXT4_MOUNT_GUARD.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Format a fresh ext4 file at `dir/disk.img`, returning the mounted
+    /// filesystem together with the serialization guard (hold both for the
+    /// duration of the test). The image path is always `dir.path()/disk.img`.
+    fn formatted_fs(dir: &TempDir, bytes: u64) -> (Ext4Fs, MutexGuard<'static, ()>) {
+        let guard = mount_guard();
         let path = dir.path().join("disk.img");
         let device = FileBlockDevice::create(&path, bytes).expect("create disk");
         mkfs(device, &MkfsOptions::default()).expect("mkfs");
         let device = FileBlockDevice::open(&path).expect("reopen disk");
-        Ext4Fs::mount(device, false).expect("mount")
+        let fs = Ext4Fs::mount(device, false).expect("mount");
+        (fs, guard)
     }
 
     #[test]
     fn timestamp_setters_roundtrip() {
         let dir = TempDir::new().unwrap();
-        let fs = formatted_fs(&dir, 8 * 1024 * 1024);
+        let (fs, _guard) = formatted_fs(&dir, 8 * 1024 * 1024);
 
         let f = fs.open("/ts.bin", OpenFlags::CREATE | OpenFlags::WRITE).expect("create");
         drop(f);
@@ -597,11 +664,67 @@ mod tests {
         fs.umount().unwrap();
     }
 
+    #[cfg(feature = "gpl-extents")]
+    #[test]
+    fn file_extents_map_to_image_bytes() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let dir = TempDir::new().unwrap();
+        let (fs, _guard) = formatted_fs(&dir, 8 * 1024 * 1024);
+        let img = dir.path().join("disk.img");
+
+        // Distinctive multi-block content so we exercise more than one block
+        // (and, when the allocator fragments it, more than one extent).
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        {
+            let mut f = fs
+                .open("/data.bin", OpenFlags::CREATE | OpenFlags::WRITE)
+                .expect("create file");
+            f.write_all(&content).expect("write");
+        }
+
+        let bs = fs.stat().expect("stat").block_size as u64;
+        let extents = fs.file_extents("/data.bin").expect("file_extents");
+        fs.umount().expect("umount"); // flush the image to disk.img
+
+        assert!(!extents.is_empty(), "a regular file must have >= 1 extent");
+
+        // Extents are block-aligned and cover the file's stored bytes (file
+        // size rounded up to a whole block).
+        let stored: u64 = extents.iter().map(|e| e.len_bytes).sum();
+        let rounded = (content.len() as u64).div_ceil(bs) * bs;
+        assert_eq!(stored, rounded, "extents must cover the block-rounded file");
+        for e in &extents {
+            assert_eq!(e.image_byte % bs, 0, "image_byte block-aligned");
+            assert_eq!(e.len_bytes % bs, 0, "len_bytes block-aligned");
+        }
+
+        // Reassemble the file from the raw image, reading only the extent
+        // ranges (seek per run, in logical order) — it must reproduce the
+        // content byte-for-byte. This is exactly what the host-side CAS chunker
+        // relies on.
+        let mut raw = std::fs::File::open(&img).unwrap();
+        let mut ordered = extents.clone();
+        ordered.sort_by_key(|e| e.logical_byte);
+        let mut assembled = Vec::with_capacity(rounded as usize);
+        for e in &ordered {
+            raw.seek(SeekFrom::Start(e.image_byte)).unwrap();
+            let mut run = vec![0u8; e.len_bytes as usize];
+            raw.read_exact(&mut run).unwrap();
+            assembled.extend_from_slice(&run);
+        }
+        assert_eq!(
+            &assembled[..content.len()],
+            &content[..],
+            "file bytes reassembled from image extents must match"
+        );
+    }
+
     #[cfg(feature = "gpl-xattr")]
     #[test]
     fn xattr_set_get_list_remove_roundtrip() {
         let dir = TempDir::new().unwrap();
-        let fs = formatted_fs(&dir, 8 * 1024 * 1024);
+        let (fs, _guard) = formatted_fs(&dir, 8 * 1024 * 1024);
 
         let f = fs
             .open("/cap.bin", OpenFlags::CREATE | OpenFlags::WRITE)
