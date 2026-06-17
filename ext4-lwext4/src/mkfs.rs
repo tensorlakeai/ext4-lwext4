@@ -154,6 +154,29 @@ pub fn mkfs<B: BlockDevice + 'static>(device: B, options: &MkfsOptions) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blockdev::FileBlockDevice;
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use tempfile::TempDir;
+
+    fn read_exact_at(file: &mut File, offset: u64, len: usize) -> Vec<u8> {
+        let mut buf = vec![0; len];
+        file.seek(SeekFrom::Start(offset)).expect("seek");
+        file.read_exact(&mut buf).expect("read");
+        buf
+    }
+
+    fn read_u16(buf: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_u32(buf: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64_lo_hi(buf: &[u8], lo_offset: usize, hi_offset: usize) -> u64 {
+        read_u32(buf, lo_offset) as u64 | ((read_u32(buf, hi_offset) as u64) << 32)
+    }
 
     #[test]
     fn test_mkfs_options_builder() {
@@ -166,5 +189,104 @@ mod tests {
         assert_eq!(opts.label, Some("test_disk".to_string()));
         assert_eq!(opts.block_size, 4096);
         assert!(opts.journal);
+    }
+
+    fn assert_partial_last_group_free_counts_match_bitmap(
+        block_size: u32,
+        real_last_group_blocks: u64,
+    ) {
+        let first_data_block = if block_size > 1024 { 0 } else { 1 };
+        let blocks_per_group = block_size as u64 * 8;
+        let image_blocks = first_data_block + blocks_per_group + real_last_group_blocks;
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join(format!("partial-last-group-{}.img", block_size));
+        let device =
+            FileBlockDevice::create_with_block_size(&path, image_blocks * block_size as u64, 512)
+                .expect("create disk");
+
+        mkfs(
+            device,
+            &MkfsOptions::ext4()
+                .with_block_size(block_size)
+                .with_journal(false),
+        )
+        .expect("mkfs");
+
+        let mut file = File::open(&path).expect("open image");
+        let sb = read_exact_at(&mut file, 1024, 1024);
+        let blocks = read_u64_lo_hi(&sb, 4, 0x150);
+        let superblock_free = read_u64_lo_hi(&sb, 12, 0x158);
+        let actual_first_data_block = read_u32(&sb, 20) as u64;
+        let actual_block_size = 1024u64 << read_u32(&sb, 24);
+        let actual_blocks_per_group = read_u32(&sb, 32) as u64;
+        let desc_size = read_u16(&sb, 254).max(32) as usize;
+        let groups = (blocks - actual_first_data_block).div_ceil(actual_blocks_per_group);
+        let last_group = groups - 1;
+        let actual_real_last_group_blocks =
+            blocks - actual_first_data_block - actual_blocks_per_group * last_group;
+
+        assert_eq!(actual_block_size, block_size as u64);
+        assert_eq!(actual_first_data_block, first_data_block);
+        assert_eq!(actual_blocks_per_group, blocks_per_group);
+        assert_eq!(groups, 2);
+        assert_eq!(actual_real_last_group_blocks, real_last_group_blocks);
+
+        let descriptor_table_offset = if actual_block_size == 1024 {
+            2 * actual_block_size
+        } else {
+            actual_block_size
+        };
+        let mut descriptor_free_sum = 0u64;
+        let mut last_descriptor_free = 0u64;
+        let mut last_bitmap_free = 0u64;
+        for group in 0..groups {
+            let desc = read_exact_at(
+                &mut file,
+                descriptor_table_offset + group * desc_size as u64,
+                desc_size,
+            );
+            let descriptor_free = read_u16(&desc, 12) as u64
+                | if desc_size > 32 {
+                    (read_u16(&desc, 44) as u64) << 16
+                } else {
+                    0
+                };
+            descriptor_free_sum += descriptor_free;
+
+            if group == last_group {
+                last_descriptor_free = descriptor_free;
+                let bitmap_block = read_u32(&desc, 0) as u64
+                    | if desc_size > 32 {
+                        (read_u32(&desc, 32) as u64) << 32
+                    } else {
+                        0
+                    };
+                let bitmap = read_exact_at(
+                    &mut file,
+                    bitmap_block * actual_block_size,
+                    actual_block_size as usize,
+                );
+                for bit in 0..actual_blocks_per_group {
+                    if bitmap[(bit / 8) as usize] & (1 << (bit % 8)) == 0 {
+                        last_bitmap_free += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(last_descriptor_free, last_bitmap_free);
+        assert_eq!(superblock_free, descriptor_free_sum);
+    }
+
+    #[test]
+    fn mkfs_partial_last_group_free_counts_match_bitmap_4k() {
+        assert_partial_last_group_free_counts_match_bitmap(4096, 8192);
+    }
+
+    #[test]
+    fn mkfs_partial_last_group_free_counts_match_bitmap_1k() {
+        assert_partial_last_group_free_counts_match_bitmap(1024, 2047);
     }
 }
