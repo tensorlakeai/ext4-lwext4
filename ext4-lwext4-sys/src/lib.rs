@@ -484,6 +484,7 @@ unsafe extern "C" {
 
     /// Get file mode (permissions)
     pub fn ext4_mode_get(path: *const c_char, mode: *mut u32) -> c_int;
+    pub fn ext4_nlink_get(path: *const c_char, nlink: *mut u32) -> c_int;
 
     /// Set file mode (permissions)
     pub fn ext4_mode_set(path: *const c_char, mode: u32) -> c_int;

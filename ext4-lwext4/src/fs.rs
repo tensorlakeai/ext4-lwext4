@@ -10,8 +10,8 @@ use ext4_lwext4_sys::{
     ext4_device_register, ext4_device_unregister, ext4_dir_mk, ext4_dir_rm, ext4_file_extent,
     ext4_file_get_extents, ext4_flink, ext4_fremove, ext4_frename, ext4_fsymlink, ext4_inode_exist,
     ext4_journal_start, ext4_journal_stop, ext4_mode_get, ext4_mode_set, ext4_mount,
-    ext4_mount_point_stats, ext4_mount_stats, ext4_mtime_get, ext4_mtime_set, ext4_owner_get,
-    ext4_owner_set, ext4_readlink, ext4_recover, ext4_umount,
+    ext4_mount_point_stats, ext4_mount_stats, ext4_mtime_get, ext4_mtime_set, ext4_nlink_get,
+    ext4_owner_get, ext4_owner_set, ext4_readlink, ext4_recover, ext4_umount,
 };
 #[cfg(feature = "gpl-xattr")]
 use ext4_lwext4_sys::{ext4_getxattr, ext4_listxattr, ext4_removexattr, ext4_setxattr};
@@ -407,6 +407,10 @@ impl Ext4Fs {
         let mut gid: u32 = 0;
         unsafe { ext4_owner_get(full_path.as_ptr(), &mut uid, &mut gid) };
 
+        // Get link count
+        let mut nlink: u32 = 1;
+        unsafe { ext4_nlink_get(full_path.as_ptr(), &mut nlink) };
+
         // Get timestamps
         let mut atime: u32 = 0;
         let mut mtime: u32 = 0;
@@ -438,7 +442,7 @@ impl Ext4Fs {
             atime: atime as u64,
             mtime: mtime as u64,
             ctime: ctime as u64,
-            nlink: 1, // Not easily available
+            nlink,
         })
     }
 
@@ -776,6 +780,29 @@ mod tests {
         // writes into a freshly-formatted image), so we don't gate on remove
         // here. If the materializer ever grows a remove path, fix lwext4 first.
         let _ = fs.remove_xattr("/cap.bin", "security.capability");
+
+        fs.umount().unwrap();
+    }
+
+    /// `metadata()` must report the real link count (it used to hardcode 1,
+    /// which broke hardlink assertions in downstream consumers).
+    #[test]
+    fn metadata_reports_real_link_count() {
+        let dir = TempDir::new().unwrap();
+        let (fs, _guard) = formatted_fs(&dir, 8 * 1024 * 1024);
+
+        let f = fs
+            .open("/target.bin", OpenFlags::CREATE | OpenFlags::WRITE)
+            .expect("create");
+        drop(f);
+        assert_eq!(fs.metadata("/target.bin").expect("stat").nlink, 1);
+
+        fs.link("/target.bin", "/alias.bin").expect("hardlink");
+        assert_eq!(fs.metadata("/target.bin").expect("stat").nlink, 2);
+        assert_eq!(fs.metadata("/alias.bin").expect("stat").nlink, 2);
+
+        fs.remove("/alias.bin").expect("remove alias");
+        assert_eq!(fs.metadata("/target.bin").expect("stat").nlink, 1);
 
         fs.umount().unwrap();
     }
