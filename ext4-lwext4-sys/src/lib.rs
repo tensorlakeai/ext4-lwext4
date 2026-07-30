@@ -485,6 +485,7 @@ unsafe extern "C" {
     /// Get file mode (permissions)
     pub fn ext4_mode_get(path: *const c_char, mode: *mut u32) -> c_int;
     pub fn ext4_nlink_get(path: *const c_char, nlink: *mut u32) -> c_int;
+    pub fn ext4_stat_get(path: *const c_char, st: *mut ext4_stat) -> c_int;
 
     /// Set file mode (permissions)
     pub fn ext4_mode_set(path: *const c_char, mode: u32) -> c_int;
@@ -722,3 +723,17 @@ unsafe impl Send for ext4_blockdev {}
 unsafe impl Sync for ext4_blockdev {}
 unsafe impl Send for ext4_file {}
 unsafe impl Send for ext4_dir {}
+
+/// Mirrors `struct ext4_stat` in include/ext4.h.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ext4_stat {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
+    pub size: u64,
+}

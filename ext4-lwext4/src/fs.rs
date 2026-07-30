@@ -6,12 +6,11 @@ use crate::error::{check_errno, check_errno_with_path, Error, Result};
 use crate::file::File;
 use crate::types::{FileExtent, FileType, FsStats, Metadata, OpenFlags};
 use ext4_lwext4_sys::{
-    ext4_atime_get, ext4_atime_set, ext4_cache_flush, ext4_ctime_get, ext4_ctime_set,
-    ext4_device_register, ext4_device_unregister, ext4_dir_mk, ext4_dir_rm, ext4_file_extent,
-    ext4_file_get_extents, ext4_flink, ext4_fremove, ext4_frename, ext4_fsymlink, ext4_inode_exist,
-    ext4_journal_start, ext4_journal_stop, ext4_mode_get, ext4_mode_set, ext4_mount,
-    ext4_mount_point_stats, ext4_mount_stats, ext4_mtime_get, ext4_mtime_set, ext4_nlink_get,
-    ext4_owner_get, ext4_owner_set, ext4_readlink, ext4_recover, ext4_umount,
+    ext4_atime_set, ext4_cache_flush, ext4_ctime_set, ext4_device_register,
+    ext4_device_unregister, ext4_dir_mk, ext4_dir_rm, ext4_file_extent, ext4_file_get_extents,
+    ext4_flink, ext4_fremove, ext4_frename, ext4_fsymlink, ext4_inode_exist, ext4_journal_start,
+    ext4_journal_stop, ext4_mode_set, ext4_mount, ext4_mount_point_stats, ext4_mount_stats,
+    ext4_mtime_set, ext4_owner_set, ext4_readlink, ext4_recover, ext4_stat_get, ext4_umount,
 };
 #[cfg(feature = "gpl-xattr")]
 use ext4_lwext4_sys::{ext4_getxattr, ext4_listxattr, ext4_removexattr, ext4_setxattr};
@@ -385,13 +384,15 @@ impl Ext4Fs {
     pub fn metadata(&self, path: &str) -> Result<Metadata> {
         let full_path = self.make_path(path)?;
 
-        // Get mode to check existence
-        let mut mode: u32 = 0;
-        let ret = unsafe { ext4_mode_get(full_path.as_ptr(), &mut mode) };
+        // All stat attributes in a single path resolution. metadata() is on
+        // hot paths (rootfs materialization stats every archive entry), and
+        // issuing one path-based getter per field cost ~15% end-to-end.
+        let mut st = ext4_lwext4_sys::ext4_stat::default();
+        let ret = unsafe { ext4_stat_get(full_path.as_ptr(), &mut st) };
         check_errno_with_path(ret, path)?;
 
         // Determine file type from mode
-        let file_type = match mode & 0o170000 {
+        let file_type = match st.mode & 0o170000 {
             0o100000 => FileType::RegularFile,
             0o040000 => FileType::Directory,
             0o120000 => FileType::Symlink,
@@ -402,32 +403,10 @@ impl Ext4Fs {
             _ => FileType::Unknown,
         };
 
-        // Get owner
-        let mut uid: u32 = 0;
-        let mut gid: u32 = 0;
-        unsafe { ext4_owner_get(full_path.as_ptr(), &mut uid, &mut gid) };
-
-        // Get link count
-        let mut nlink: u32 = 1;
-        unsafe { ext4_nlink_get(full_path.as_ptr(), &mut nlink) };
-
-        // Get timestamps
-        let mut atime: u32 = 0;
-        let mut mtime: u32 = 0;
-        let mut ctime: u32 = 0;
-        unsafe {
-            ext4_atime_get(full_path.as_ptr(), &mut atime);
-            ext4_mtime_get(full_path.as_ptr(), &mut mtime);
-            ext4_ctime_get(full_path.as_ptr(), &mut ctime);
-        }
-
-        // For file size, we need to open the file temporarily
+        // Preserve the historical contract: size is reported for regular
+        // files only (other types returned 0 when this used File::open).
         let size = if file_type == FileType::RegularFile {
-            if let Ok(file) = File::open(self, path, OpenFlags::READ) {
-                file.size()
-            } else {
-                0
-            }
+            st.size
         } else {
             0
         };
@@ -436,13 +415,13 @@ impl Ext4Fs {
             file_type,
             size,
             blocks: 0, // Not easily available without reading inode directly
-            mode: mode & 0o7777, // Mask out file type bits
-            uid,
-            gid,
-            atime: atime as u64,
-            mtime: mtime as u64,
-            ctime: ctime as u64,
-            nlink,
+            mode: st.mode & 0o7777, // Mask out file type bits
+            uid: st.uid,
+            gid: st.gid,
+            atime: st.atime as u64,
+            mtime: st.mtime as u64,
+            ctime: st.ctime as u64,
+            nlink: st.nlink,
         })
     }
 
