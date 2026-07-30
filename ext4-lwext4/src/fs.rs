@@ -779,6 +779,85 @@ mod tests {
 
         fs.umount().unwrap();
     }
+
+    /// Regression test: lwext4's slow-symlink path (target >= 60 bytes)
+    /// stores the target in a freshly allocated data block. That block can
+    /// be a recycled one carrying bytes from previously freed content, and
+    /// the writer must zero-fill the tail — e2fsck requires a slow symlink's
+    /// block to hold exactly `i_size` NUL-terminated bytes and otherwise
+    /// reports the symlink invalid and its dirent unrepairable in preen mode
+    /// ("incorrect filetype (was 7, should be 0)").
+    #[test]
+    fn slow_symlink_block_tail_is_zeroed_after_block_reuse() {
+        use std::io::Read as _;
+
+        let dir = TempDir::new().unwrap();
+        let (fs, _guard) = formatted_fs(&dir, 16 * 1024 * 1024);
+        let img = dir.path().join("disk.img");
+
+        // Dirty a batch of data blocks with a distinctive non-zero fill,
+        // then free them so the allocator hands them back out.
+        fs.mkdir("/churn", 0o755).expect("mkdir churn");
+        let fill = vec![0xAAu8; 4096];
+        for i in 0..64 {
+            let mut f = fs
+                .open(&format!("/churn/f{i:03}"), OpenFlags::CREATE | OpenFlags::WRITE)
+                .expect("create churn file");
+            f.write_all(&fill).expect("write churn file");
+        }
+        for i in 0..64 {
+            fs.remove(&format!("/churn/f{i:03}")).expect("remove churn file");
+        }
+
+        // Slow symlinks: unique targets, all longer than the 60-byte inline
+        // limit, so each needs a data block — allocated from the freed set.
+        let mut targets = Vec::new();
+        for i in 0..16 {
+            let target = format!(
+                "/usr/share/ca-certificates/mozilla/DigiCert_Assured_ID_Root_{i:04}_padding.crt"
+            );
+            assert!(target.len() >= 60, "target must force the slow-symlink path");
+            fs.symlink(&target, &format!("/link{i:02}")).expect("symlink");
+            targets.push(target);
+        }
+
+        fs.umount().expect("umount");
+
+        let mut image = Vec::new();
+        std::fs::File::open(&img)
+            .expect("open image")
+            .read_to_end(&mut image)
+            .expect("read image");
+
+        // Every block-aligned copy of a target (the live symlink block, plus
+        // any journaled copy) must be zero-padded to its block boundary.
+        for target in &targets {
+            let needle = target.as_bytes();
+            let mut found_block_aligned = false;
+            let mut pos = 0;
+            while let Some(off) = image[pos..]
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .map(|p| p + pos)
+            {
+                if off % 4096 == 0 {
+                    found_block_aligned = true;
+                    let tail = &image[off + needle.len()..off + 4096];
+                    assert!(
+                        tail.iter().all(|&b| b == 0),
+                        "symlink target block for {target} carries a non-zero \
+                         tail (first bytes: {:02x?})",
+                        &tail[..8.min(tail.len())]
+                    );
+                }
+                pos = off + 1;
+            }
+            assert!(
+                found_block_aligned,
+                "expected a block-aligned data block holding target {target}"
+            );
+        }
+    }
 }
 
 impl Drop for Ext4Fs {
