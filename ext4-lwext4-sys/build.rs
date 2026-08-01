@@ -69,6 +69,25 @@ fn main() {
         .warnings(false)
         .compile("lwext4");
 
-    println!("cargo:rerun-if-changed=vendor/lwext4/src");
-    println!("cargo:rerun-if-changed=vendor/lwext4/include");
+    // Emit rerun-if-changed per file (recursively). A bare directory path only
+    // tracks the directory's own mtime, which does not change when a file inside
+    // it is edited — so editing a vendored .c/.h would not trigger a rebuild
+    // (and could ship a stale object). Walk and list every file instead.
+    emit_rerun_if_changed(std::path::Path::new("vendor/lwext4/src"));
+    emit_rerun_if_changed(std::path::Path::new("vendor/lwext4/include"));
+    println!("cargo:rerun-if-changed=vendor/helpers.c");
+}
+
+fn emit_rerun_if_changed(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            emit_rerun_if_changed(&path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
