@@ -9,8 +9,9 @@ use ext4_lwext4_sys::{
     ext4_atime_set, ext4_cache_flush, ext4_ctime_set, ext4_device_register,
     ext4_device_unregister, ext4_dir_mk, ext4_dir_rm, ext4_file_extent, ext4_file_get_extents,
     ext4_flink, ext4_fremove, ext4_frename, ext4_fsymlink, ext4_inode_exist, ext4_journal_start,
-    ext4_journal_stop, ext4_mode_set, ext4_mount, ext4_mount_point_stats, ext4_mount_stats,
-    ext4_mtime_set, ext4_owner_set, ext4_readlink, ext4_recover, ext4_stat_get, ext4_umount,
+    ext4_journal_stop, ext4_mknod, ext4_mode_set, ext4_mount, ext4_mount_point_stats,
+    ext4_mount_stats, ext4_mtime_set, ext4_owner_set, ext4_readlink, ext4_recover, ext4_stat_get,
+    ext4_umount,
 };
 #[cfg(feature = "gpl-xattr")]
 use ext4_lwext4_sys::{ext4_getxattr, ext4_listxattr, ext4_removexattr, ext4_setxattr};
@@ -137,15 +138,6 @@ impl Ext4Fs {
         check_errno(ret)?;
 
         Ok(())
-    }
-
-    /// Build the raw lwext4 path for a filesystem-relative path.
-    ///
-    /// This is intended for operations exposed by `ext4-lwext4-sys` but not
-    /// yet wrapped by this crate. The returned path is only valid while this
-    /// filesystem remains mounted.
-    pub fn raw_path(&self, path: &str) -> Result<CString> {
-        self.make_path(path)
     }
 
     /// Create a full path by prepending the mount point.
@@ -276,6 +268,30 @@ impl Ext4Fs {
         }
 
         Ok(())
+    }
+
+    /// Create a special filesystem node.
+    ///
+    /// `file_type` must be [`FileType::BlockDevice`],
+    /// [`FileType::CharDevice`], [`FileType::Fifo`], or [`FileType::Socket`].
+    /// For device nodes, `device` is the encoded ext4 device number. It is
+    /// ignored for FIFOs and sockets.
+    pub fn mknod(&self, path: &str, file_type: FileType, device: u32) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if !matches!(
+            file_type,
+            FileType::BlockDevice | FileType::CharDevice | FileType::Fifo | FileType::Socket
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "mknod does not support {file_type:?}"
+            )));
+        }
+
+        let full_path = self.make_path(path)?;
+        let ret = unsafe { ext4_mknod(full_path.as_ptr(), file_type.to_raw() as i32, device) };
+        check_errno_with_path(ret, path)
     }
 
     /// Remove a file.
@@ -651,15 +667,55 @@ mod tests {
     }
 
     #[test]
-    fn raw_path_exposes_the_registered_mount_without_mutating_the_filesystem() {
+    fn path_construction_uses_the_registered_mount_without_mutating_the_image() {
+        let dir = TempDir::new().unwrap();
+        let (fs, _guard) = formatted_fs(&dir, 8 * 1024 * 1024);
+        let image_path = dir.path().join("disk.img");
+
+        fs.mkdir("/special", 0o755).unwrap();
+        fs.sync().unwrap();
+        let before = std::fs::read(&image_path).unwrap();
+
+        let raw_path = fs.make_path("/special").unwrap();
+        let ret = unsafe {
+            ext4_inode_exist(raw_path.as_ptr(), FileType::Directory.to_raw() as i32)
+        };
+        assert_eq!(ret, 0, "constructed path must use the registered mount");
+        assert!(fs.make_path("/invalid\0path").is_err());
+
+        fs.sync().unwrap();
+        let after = std::fs::read(&image_path).unwrap();
+        assert_eq!(
+            before, after,
+            "constructing and resolving an lwext4 path must not alter image bytes"
+        );
+
+        fs.umount().unwrap();
+    }
+
+    #[test]
+    fn mknod_creates_only_supported_special_file_types() {
         let dir = TempDir::new().unwrap();
         let (fs, _guard) = formatted_fs(&dir, 8 * 1024 * 1024);
 
-        assert!(!fs.exists("/special"));
-        let raw_path = fs.raw_path("/special").unwrap();
-        assert!(raw_path.to_bytes().ends_with(b"/special"));
-        assert!(!fs.exists("/special"));
-        assert!(fs.raw_path("/invalid\0path").is_err());
+        fs.mknod("/fifo", FileType::Fifo, 0).unwrap();
+        fs.mknod("/char", FileType::CharDevice, 0x0103).unwrap();
+        fs.mknod("/block", FileType::BlockDevice, 0x0800).unwrap();
+
+        assert_eq!(fs.metadata("/fifo").unwrap().file_type, FileType::Fifo);
+        assert_eq!(
+            fs.metadata("/char").unwrap().file_type,
+            FileType::CharDevice
+        );
+        assert_eq!(
+            fs.metadata("/block").unwrap().file_type,
+            FileType::BlockDevice
+        );
+        assert!(matches!(
+            fs.mknod("/regular", FileType::RegularFile, 0),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(!fs.exists("/regular"));
 
         fs.umount().unwrap();
     }
