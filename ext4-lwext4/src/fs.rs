@@ -685,8 +685,8 @@ mod tests {
 
         fs.sync().unwrap();
         let after = std::fs::read(&image_path).unwrap();
-        assert_eq!(
-            before, after,
+        assert!(
+            before == after,
             "constructing and resolving an lwext4 path must not alter image bytes"
         );
 
@@ -701,6 +701,7 @@ mod tests {
         fs.mknod("/fifo", FileType::Fifo, 0).unwrap();
         fs.mknod("/char", FileType::CharDevice, 0x0103).unwrap();
         fs.mknod("/block", FileType::BlockDevice, 0x0800).unwrap();
+        fs.mknod("/socket", FileType::Socket, 0).unwrap();
 
         assert_eq!(fs.metadata("/fifo").unwrap().file_type, FileType::Fifo);
         assert_eq!(
@@ -711,6 +712,10 @@ mod tests {
             fs.metadata("/block").unwrap().file_type,
             FileType::BlockDevice
         );
+        assert_eq!(
+            fs.metadata("/socket").unwrap().file_type,
+            FileType::Socket
+        );
         assert!(matches!(
             fs.mknod("/regular", FileType::RegularFile, 0),
             Err(Error::InvalidArgument(_))
@@ -718,6 +723,16 @@ mod tests {
         assert!(!fs.exists("/regular"));
 
         fs.umount().unwrap();
+
+        let image_path = dir.path().join("disk.img");
+        let device = FileBlockDevice::open(&image_path).unwrap();
+        let read_only_fs = Ext4Fs::mount(device, true).unwrap();
+        assert!(matches!(
+            read_only_fs.mknod("/read-only", FileType::Fifo, 0),
+            Err(Error::ReadOnly)
+        ));
+        assert!(!read_only_fs.exists("/read-only"));
+        read_only_fs.umount().unwrap();
     }
 
     #[cfg(feature = "gpl-extents")]
