@@ -16,7 +16,7 @@ use ext4_lwext4_sys::{
 use ext4_lwext4_sys::{ext4_getxattr, ext4_listxattr, ext4_removexattr, ext4_setxattr};
 #[cfg(feature = "gpl-xattr")]
 use std::ffi::c_void;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, CString};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -139,10 +139,13 @@ impl Ext4Fs {
         Ok(())
     }
 
-    /// Get the mount point path used internally.
-    #[allow(dead_code)]
-    pub(crate) fn mount_point(&self) -> &CStr {
-        &self.mount_point
+    /// Build the raw lwext4 path for a filesystem-relative path.
+    ///
+    /// This is intended for operations exposed by `ext4-lwext4-sys` but not
+    /// yet wrapped by this crate. The returned path is only valid while this
+    /// filesystem remains mounted.
+    pub fn raw_path(&self, path: &str) -> Result<CString> {
+        self.make_path(path)
     }
 
     /// Create a full path by prepending the mount point.
@@ -643,6 +646,20 @@ mod tests {
         assert_eq!(md.mtime, 1_700_000_000);
         assert_eq!(md.atime, 1_700_000_001);
         assert_eq!(md.ctime, 1_700_000_002);
+
+        fs.umount().unwrap();
+    }
+
+    #[test]
+    fn raw_path_exposes_the_registered_mount_without_mutating_the_filesystem() {
+        let dir = TempDir::new().unwrap();
+        let (fs, _guard) = formatted_fs(&dir, 8 * 1024 * 1024);
+
+        assert!(!fs.exists("/special"));
+        let raw_path = fs.raw_path("/special").unwrap();
+        assert!(raw_path.to_bytes().ends_with(b"/special"));
+        assert!(!fs.exists("/special"));
+        assert!(fs.raw_path("/invalid\0path").is_err());
 
         fs.umount().unwrap();
     }
